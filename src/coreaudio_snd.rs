@@ -41,6 +41,51 @@ unsafe extern "C" fn saudio_coreaudio_callback(
     AudioQueueEnqueueBuffer(queue, buffer, 0, std::ptr::null_mut());
 }
 
+/// Puts the app's audio session in the Ambient category, so its sound mixes
+/// with other apps' audio. The default, Solo Ambient, stops other apps' audio
+/// once the queue starts, and they don't resume if the category changes later,
+/// so this must run before `AudioQueueStart`. If it fails, sound still plays
+/// under the default category.
+#[cfg(any(target_os = "ios", target_os = "tvos"))]
+unsafe fn set_ambient_audio_session() {
+    use std::os::raw::{c_char, c_void};
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+        static AVAudioSessionCategoryAmbient: Id;
+    }
+
+    // On arm64, `objc_msgSend` must be called through a pointer of the
+    // method's exact type.
+    let send_shared: unsafe extern "C" fn(Id, Sel) -> Id =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    let send_set_category: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> i8 =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+    let class = objc_getClass(b"AVAudioSession\0".as_ptr() as *const c_char);
+    if class.is_null() {
+        return;
+    }
+    let session = send_shared(
+        class,
+        sel_registerName(b"sharedInstance\0".as_ptr() as *const c_char),
+    );
+    if session.is_null() {
+        return;
+    }
+    send_set_category(
+        session,
+        sel_registerName(b"setCategory:error:\0".as_ptr() as *const c_char),
+        AVAudioSessionCategoryAmbient,
+        std::ptr::null_mut(),
+    );
+}
+
 impl AudioContext {
     pub fn new() -> AudioContext {
         use crate::mixer::{self, Mixer};
@@ -49,6 +94,9 @@ impl AudioContext {
         let mixer = Box::new(mixer_builder.build());
 
         unsafe {
+            #[cfg(any(target_os = "ios", target_os = "tvos"))]
+            set_ambient_audio_session();
+
             let fmt = _saudio_AudioStreamBasicDescription {
                 mSampleRate: consts::RATE as f64,
                 mFormatID: _saudio_kAudioFormatLinearPCM,
