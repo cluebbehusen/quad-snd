@@ -1,12 +1,14 @@
 use crate::{AudioContext, PlaySoundParams};
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::mpsc;
 
 enum AudioMessage {
-    AddSound(u32, Vec<f32>),
+    AddSound(u32, Arc<[f32]>),
     Play(u32, u32, bool, f32),
     Stop(u32),
     StopAll(u32),
@@ -56,6 +58,19 @@ pub struct MixerControl {
     tx: mpsc::Sender<AudioMessage>,
     sound_id: Cell<u32>,
     play_id: Cell<u32>,
+    /// Every file a live sound was loaded from, by a hash of its bytes.
+    decoded: RefCell<HashMap<u64, Vec<Decoded>>>,
+}
+
+/// One file's samples, decoded once and shared by every live sound loaded
+/// from the same bytes. A caller that loads a file several times, to stop
+/// each copy by its own sound id, keeps one copy of the samples.
+struct Decoded {
+    /// The file itself, which confirms a hash match.
+    bytes: Box<[u8]>,
+    samples: Arc<[f32]>,
+    /// The live sounds loaded from the file.
+    sounds: Vec<u32>,
 }
 
 pub struct Playback {
@@ -77,7 +92,7 @@ impl MixerControl {
     pub fn load(&self, data: &[u8]) -> u32 {
         let sound_id = self.sound_id.get();
 
-        let samples = load_samples_from_file(data).unwrap();
+        let samples = self.samples(sound_id, data);
 
         self.tx
             .send(crate::mixer::AudioMessage::AddSound(sound_id, samples))
@@ -85,6 +100,26 @@ impl MixerControl {
         self.sound_id.set(sound_id + 1);
 
         sound_id
+    }
+
+    /// The samples of `data` for `sound_id`: those of an earlier load of the
+    /// same bytes, or a fresh decode.
+    fn samples(&self, sound_id: u32, data: &[u8]) -> Arc<[f32]> {
+        let mut hasher = DefaultHasher::new();
+        data.hash(&mut hasher);
+        let mut decoded = self.decoded.borrow_mut();
+        let files = decoded.entry(hasher.finish()).or_default();
+        if let Some(file) = files.iter_mut().find(|file| *file.bytes == *data) {
+            file.sounds.push(sound_id);
+            return file.samples.clone();
+        }
+        let samples: Arc<[f32]> = load_samples_from_file(data).unwrap().into();
+        files.push(Decoded {
+            bytes: data.into(),
+            samples: samples.clone(),
+            sounds: vec![sound_id],
+        });
+        samples
     }
 
     pub fn play(&self, sound_id: u32, params: PlaySoundParams) -> Playback {
@@ -115,6 +150,14 @@ impl MixerControl {
     }
 
     pub fn delete(&self, sound_id: u32) {
+        let mut decoded = self.decoded.borrow_mut();
+        for files in decoded.values_mut() {
+            for file in files.iter_mut() {
+                file.sounds.retain(|&id| id != sound_id);
+            }
+            files.retain(|file| !file.sounds.is_empty());
+        }
+        decoded.retain(|_, files| !files.is_empty());
         self.send(AudioMessage::Delete(sound_id));
     }
 
@@ -145,6 +188,7 @@ impl Mixer {
                 tx,
                 sound_id: Cell::new(0),
                 play_id: Cell::new(0),
+                decoded: RefCell::new(HashMap::new()),
             },
         )
     }
@@ -153,7 +197,7 @@ impl Mixer {
         while let Ok(message) = self.rx.try_recv() {
             match message {
                 AudioMessage::AddSound(id, data) => {
-                    self.sounds.insert(id, data.into());
+                    self.sounds.insert(id, data);
                 }
                 AudioMessage::Play(sound_id, play_id, looped, volume) => {
                     if let Some(data) = self.sounds.get(&sound_id) {
@@ -286,3 +330,6 @@ pub fn load_samples_from_file(bytes: &[u8]) -> Result<Vec<f32>, ()> {
 
     Ok(frames)
 }
+
+#[cfg(test)]
+mod tests;
